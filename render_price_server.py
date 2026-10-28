@@ -1,6 +1,8 @@
 """Render HTTP health endpoint and Twelve Data WebSocket price receiver."""
 import json
 import os
+import re
+from collections import deque
 import threading
 import time
 from datetime import datetime, timezone
@@ -79,7 +81,53 @@ def stream_loop():
 # Benzinga live news stream runs independently of the Twelve Data price stream.
 BENZINGA_KEY = os.getenv("BENZINGA_API_KEY", "")
 NEWS_STATE = {"connection": "not_configured", "message_count": 0, "last_news_at": None,
-              "last_news": None, "last_error": None}
+              "last_news": None, "last_error": None, "candidate_count": 0, "confirmed_count": 0,
+              "last_candidate": None, "last_confirmed": None, "unclassified_count": 0}
+SEEN = set()
+SEEN_ORDER = deque()
+PENNY_TERMS = ("penny stock", "penny stocks", "small cap", "small-cap", "microcap", "micro-cap",
+               "fda", "merger", "contract", "clinical trial", "reverse split", "offering", "nasdaq compliance")
+US_EXCHANGES = {"NASDAQ", "NYSE", "AMEX", "NYSE AMERICAN", "NYSEAMERICAN"}
+
+def news_symbols(content):
+    stocks = content.get("stocks") or []
+    if not isinstance(stocks, list):
+        return []
+    symbols = []
+    for item in stocks:
+        if not isinstance(item, dict):
+            continue
+        sym = str(item.get("name") or item.get("symbol") or item.get("ticker") or "").upper().strip()
+        exchange = str(item.get("exchange") or "").upper().strip()
+        if not re.fullmatch(r"[A-Z]{1,5}(?:[.-][A-Z]{1,2})?", sym):
+            continue
+        if exchange and exchange not in US_EXCHANGES:
+            continue
+        if sym not in symbols:
+            symbols.append(sym)
+    return symbols[:25]
+
+def penny_classification(content, symbols):
+    if not symbols:
+        return "unclassified_no_ticker"
+    channels = content.get("channels") or []
+    categories = [str(x.get("name") or "").lower() for x in channels if isinstance(x, dict)] if isinstance(channels, list) else []
+    title = str(content.get("title") or "").lower()
+    if not any(k in title for k in PENNY_TERMS) and not any(k in ("penny stocks", "small cap", "fda", "contracts", "biotech") for k in categories):
+        return "unclassified_not_penny_specific"
+    with LOCK:
+        price_data = STATE.get("last_price")
+        at = STATE.get("last_price_at")
+    if isinstance(price_data, dict) and price_data.get("symbol") in symbols and at:
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(at)).total_seconds()
+            price = float(price_data["price"])
+            if 0 <= age <= 120:
+                return "confirmed_under_5" if 0 < price < 5 else "excluded_price_over_5"
+        except (TypeError, ValueError):
+            pass
+    return "candidate_price_unverified"
+
 
 def benzinga_stream_loop():
     if not BENZINGA_KEY:
@@ -99,6 +147,8 @@ def benzinga_stream_loop():
             print("BENZINGA connected", flush=True)
 
         def on_message(ws, raw):
+            if raw == "pong":
+                return
             try:
                 event = json.loads(raw)
             except (ValueError, TypeError):
@@ -107,20 +157,38 @@ def benzinga_stream_loop():
                 return
             data = event.get("data") or {}
             if not isinstance(data, dict):
-                data = {}
+                return
             content = data.get("content") or {}
             if not isinstance(content, dict):
                 content = {}
-            stocks = content.get("stocks") or []
-            symbols = [s.get("name") for s in stocks if isinstance(s, dict) and s.get("name")] if isinstance(stocks, list) else []
-            news = {"action": data.get("action"), "id": content.get("id") or event.get("id"),
-                    "title": str(content.get("title") or "")[:250], "symbols": symbols[:25]}
-            now = datetime.now(timezone.utc).isoformat()
+            msgid = event.get("id")
+            if msgid:
+                with LOCK:
+                    if msgid in SEEN:
+                        return
+                    SEEN.add(msgid)
+                    SEEN_ORDER.append(msgid)
+                    if len(SEEN_ORDER) > 5000:
+                        SEEN.discard(SEEN_ORDER.popleft())
+            symbols = news_symbols(content)
+            classification = penny_classification(content, symbols)
+            news = {"action": data.get("action"), "id": data.get("id") or content.get("id"),
+                    "title": str(content.get("title") or "")[:250],
+                    "symbols": symbols, "classification": classification}
             with LOCK:
                 NEWS_STATE["message_count"] += 1
-                NEWS_STATE["last_news_at"] = now
+                NEWS_STATE["last_news_at"] = datetime.now(timezone.utc).isoformat()
                 NEWS_STATE["last_news"] = news
-            print("BENZINGA news received: " + json.dumps(news, ensure_ascii=False), flush=True)
+                if classification == "candidate_price_unverified":
+                    NEWS_STATE["candidate_count"] += 1
+                    NEWS_STATE["last_candidate"] = news
+                elif classification == "confirmed_under_5":
+                    NEWS_STATE["confirmed_count"] += 1
+                    NEWS_STATE["last_confirmed"] = news
+                elif classification.startswith("unclassified"):
+                    NEWS_STATE["unclassified_count"] += 1
+            if classification in ("candidate_price_unverified", "confirmed_under_5"):
+                print("BENZINGA PENNY NEWS " + json.dumps(news, ensure_ascii=False), flush=True)
 
         def on_error(ws, error):
             message = str(error).replace(BENZINGA_KEY, "[REDACTED]")[:180]
